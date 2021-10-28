@@ -4,77 +4,72 @@ import Glibc
 import Darwin
 #endif
 
-public actor SignalStack {
-	public static let global = SignalStack()
+public actor ChildSignalCatcher {
+	public static let global = ChildSignalCatcher()
 	fileprivate typealias MainSignalHandler = @convention(c)(Int32) -> Void
-	fileprivate static let mainHandler:MainSignalHandler = { sigVal in
-		Task.detached { [sigVal] in
-			if let handlers = await SignalStack.global.signalStack[sigVal] {
-				for handler in handlers {
-					Task.detached { [handler, sigVal] in
-						await handler.handler(sigVal)
-					}
-				}
+	fileprivate static let mainHandler:MainSignalHandler = { _ in
+		var waitResult:pid_t = 0
+		var exitCode:Int32 = 0
+		var errNo:Int32 = 0
+		repeat {
+			waitResult = waitpid(-1, &exitCode, WNOHANG)
+			errNo = errno
+		} while waitResult == -1 && errNo == EINTR
+		Task.detached { [waitResult, exitCode] in
+			for handler in await ChildSignalCatcher.global.handlerStack {
+				await handler.handler(waitResult, exitCode)
 			}
 		}
 	}
 	
-	public typealias SignalHandler = (Int32) async -> Void
+	public typealias SignalHandler = (pid_t, Int32) async -> Void
 	public typealias SignalHandle = UInt64
 	
-	fileprivate struct KeyedHandler {
+	fileprivate struct KeyedHandler:Hashable{
 		let handle:SignalHandle
 		let handler:SignalHandler
+		
+		func hash(into hasher:inout Hasher) {
+			hasher.combine(handle)
+		}
+		
+		static func == (lhs:KeyedHandler, rhs:KeyedHandler) -> Bool {
+			return lhs.handle == rhs.handle
+		}
 	}
-	fileprivate var signalStack = [Int32:[KeyedHandler]]()
+	fileprivate var handlerStack = Set<KeyedHandler>()
 	
-	@discardableResult public func add(signal:Int32, _ handler:@escaping(SignalHandler)) -> SignalHandle {
+	@discardableResult public func add(_ handler:@escaping(SignalHandler)) -> SignalHandle {
 		let newID = SignalHandle.random(in:SignalHandle.min...SignalHandle.max)
-		if var hasStack = signalStack[signal] {
-			hasStack.append(KeyedHandler(handle:newID, handler:handler))
-			signalStack[signal] = hasStack
-		} else {
-			reset(signal:signal)
-			signalStack[signal] = [KeyedHandler(handle:newID, handler:handler)]
+		let newHandler = KeyedHandler(handle:newID, handler:handler)
+		if handlerStack.count == 0 {
+			reset(signal:SIGCHLD)
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-			var signalAction = sigaction(__sigaction_u:unsafeBitCast(SignalStack.mainHandler, to:__sigaction_u.self), sa_mask:0, sa_flags:0)
+			var signalAction = sigaction(__sigaction_u:unsafeBitCast(ChildSignalCatcher.mainHandler, to:__sigaction_u.self), sa_mask:0, sa_flags:0)
 			_ = withUnsafePointer(to:&signalAction) { handlerPointer in
-				sigaction(signal, handlerPointer.pointee, nil)
+				sigaction(SIGCHLD, handlerPointer.pointee, nil)
 			}
 #elseif os(Linux)
 			var signalAction = sigaction()
-			signalAction.__sigaction_handler = unsafeBitCast(SignalStack.mainHandler, to:sigaction.__Unnamed_union___sigaction_handler.self)
-			_ = sigaction(signal, &signalAction, nil)	
+			signalAction.__sigaction_handler = unsafeBitCast(ChildSignalCatcher.mainHandler, to:sigaction.__Unnamed_union___sigaction_handler.self)
+			_ = sigaction(SIGCHLD, &signalAction, nil)	
 #endif
 		}
-		return newID
+		handlerStack.update(with:newHandler)
+		return newHandler.handle
 	}
-	
-	public func remove(signal:Int32, handle:SignalHandle) {
-		if var hasStack = signalStack[signal] {
-			hasStack.removeAll(where: { $0.handle == handle })
-			if (hasStack.count == 0) {
-				reset(signal:signal)
-				signalStack.removeValue(forKey:signal)
-			} else {
-				signalStack[signal] = hasStack
-			}
+	public func remove(handle:SignalHandle) {
+		self.handlerStack = self.handlerStack.filter({ $0.handle != handle })
+		if (self.handlerStack.count == 0) {
+			reset(signal:SIGCHLD)
 		}
 	}
 	
-	public func reset(signal:Int32) {
+	fileprivate func reset(signal:Int32) {
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
 		_ = Darwin.signal(signal, SIG_DFL)
 #elseif os(Linux)
 		_ = Glibc.signal(signal, SIG_DFL)		
-#endif
-	}
-	
-	public func ignore(signal:Int32) {
-#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-		_ = Darwin.signal(signal, SIG_IGN)
-#elseif os(Linux)
-		_ = Glibc.signal(signal, SIG_IGN)		
 #endif
 	}
 }
