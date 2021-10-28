@@ -9,20 +9,17 @@ public actor SignalStack {
 	fileprivate typealias MainSignalHandler = @convention(c)(Int32) -> Void
 	fileprivate static let mainHandler:MainSignalHandler = { sigVal in
 		Task.detached { [sigVal] in
-			await withTaskGroup(of:Void.self, returning:Void.self, body: { [sigVal] tg in
-				if let handlers = await SignalStack.global.signalStack[sigVal] {
-					for handler in handlers {
-						tg.addTask { [handler, sigVal] in
-							handler.handler(sigVal)
-						}
+			if let handlers = await SignalStack.global.signalStack[sigVal] {
+				for handler in handlers {
+					Task.detached { [handler, sigVal] in
+						await handler.handler(sigVal)
 					}
-					await tg.waitForAll()
 				}
-			})
+			}
 		}
 	}
 	
-	public typealias SignalHandler = (Int32) -> Void
+	public typealias SignalHandler = (Int32) async -> Void
 	public typealias SignalHandle = UInt64
 	
 	fileprivate struct KeyedHandler {
@@ -31,7 +28,7 @@ public actor SignalStack {
 	}
 	fileprivate var signalStack = [Int32:[KeyedHandler]]()
 	
-	@discardableResult public func add(signal:Int32, handler:@escaping(SignalHandler)) -> SignalHandle {
+	@discardableResult public func add(signal:Int32, _ handler:@escaping(SignalHandler)) -> SignalHandle {
 		let newID = SignalHandle.random(in:SignalHandle.min...SignalHandle.max)
 		if var hasStack = signalStack[signal] {
 			hasStack.append(KeyedHandler(handle:newID, handler:handler))
@@ -53,7 +50,7 @@ public actor SignalStack {
 		return newID
 	}
 	
-	public func removeHandler(signal:Int32, handle:SignalHandle) {
+	public func remove(signal:Int32, handle:SignalHandle) {
 		if var hasStack = signalStack[signal] {
 			hasStack.removeAll(where: { $0.handle == handle })
 			if (hasStack.count == 0) {
@@ -65,7 +62,7 @@ public actor SignalStack {
 		}
 	}
 	
-	func reset(signal:Int32, removingHandle:Bool = false) {
+	public func reset(signal:Int32) {
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
 		_ = Darwin.signal(signal, SIG_DFL)
 #elseif os(Linux)
@@ -73,7 +70,7 @@ public actor SignalStack {
 #endif
 	}
 	
-	func ignore(signal:Int32) {
+	public func ignore(signal:Int32) {
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
 		_ = Darwin.signal(signal, SIG_IGN)
 #elseif os(Linux)
