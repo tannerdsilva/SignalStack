@@ -11,15 +11,13 @@ public actor SignalStack {
 		Task.detached { [sigVal] in
 			if let handlers = await SignalStack.global.signalStack[sigVal] {
 				for handler in handlers {
-					Task.detached { [handler, sigVal] in
-						await handler.handler(sigVal)
-					}
+					handler.handler(sigVal)
 				}
 			}
 		}
 	}
 	
-	public typealias SignalHandler = (Int32) async -> Void
+	public typealias SignalHandler = (Int32) -> Void
 	public typealias SignalHandle = UInt64
 	
 	fileprivate struct KeyedHandler {
